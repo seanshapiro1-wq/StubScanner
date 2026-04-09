@@ -1,7 +1,6 @@
 import sys
 import json
 import time
-import re
 
 try:
     from playwright.sync_api import sync_playwright
@@ -10,19 +9,88 @@ except ImportError:
     sys.exit(1)
 
 
-def scrape_prices(url):
+def prompt_for_quantity():
+    """Ask the user how many tickets they want to filter by."""
+    while True:
+        try:
+            raw = input("How many tickets? (1-8): ").strip()
+            qty = int(raw)
+            if 1 <= qty <= 8:
+                return qty
+            print("Please enter a number between 1 and 8.")
+        except ValueError:
+            print("Please enter a valid number.")
+
+
+def select_quantity(page, quantity):
+    """Click the quantity filter on Ticketmaster and choose the desired amount."""
+    print(f"Setting quantity to {quantity}...", file=sys.stderr)
+
+    # Try several strategies since Ticketmaster's markup varies by view
+    strategies = [
+        # Strategy 1: native <select> element
+        lambda: page.select_option(
+            'select[aria-label*="quantity" i], select[name*="quantity" i], select[data-testid*="quantity" i]',
+            str(quantity),
+            timeout=5000,
+        ),
+        # Strategy 2: custom dropdown button + list option
+        lambda: _click_custom_dropdown(page, quantity),
+    ]
+
+    for i, strategy in enumerate(strategies, 1):
+        try:
+            strategy()
+            print(f"  Quantity selected via strategy {i}", file=sys.stderr)
+            # Give the page a moment to refilter
+            time.sleep(3)
+            return True
+        except Exception as e:
+            print(f"  Strategy {i} failed: {str(e)[:80]}", file=sys.stderr)
+
+    print("  WARNING: Could not set quantity — showing all prices instead", file=sys.stderr)
+    return False
+
+
+def _click_custom_dropdown(page, quantity):
+    """Open a custom dropdown trigger and click the option matching the quantity."""
+    triggers = [
+        '[data-testid*="quantity"]',
+        'button[aria-label*="quantity" i]',
+        'button[aria-label*="Number of tickets" i]',
+        '[class*="quantity" i] button',
+        '[class*="Quantity" i] button',
+    ]
+    for sel in triggers:
+        el = page.query_selector(sel)
+        if el:
+            el.click()
+            time.sleep(1)
+            # Find the option matching the quantity number
+            option_selectors = [
+                f'[role="option"]:has-text("{quantity}")',
+                f'li:has-text("{quantity}")',
+                f'button:has-text("{quantity}")',
+            ]
+            for opt_sel in option_selectors:
+                try:
+                    page.click(opt_sel, timeout=2000)
+                    return
+                except Exception:
+                    continue
+    raise Exception("No custom dropdown trigger found")
+
+
+def scrape_prices(url, quantity):
     api_data = []
 
     def capture_response(response):
-        """Intercept API responses that contain ticket/price data."""
         resp_url = response.url
-        if any(keyword in resp_url.lower() for keyword in [
-            "offers", "inventory", "price", "quickpicks",
-            "availability", "map", "shape"
+        if any(k in resp_url.lower() for k in [
+            "offers", "inventory", "price", "quickpicks", "availability", "map", "shape"
         ]):
             try:
-                body = response.json()
-                api_data.append({"url": resp_url, "data": body})
+                api_data.append({"url": resp_url, "data": response.json()})
             except Exception:
                 pass
 
@@ -42,7 +110,6 @@ def scrape_prices(url):
             timezone_id="America/New_York",
         )
 
-        # Hide automation markers
         context.add_init_script("""
             Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
             Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
@@ -51,7 +118,6 @@ def scrape_prices(url):
 
         page = context.new_page()
 
-        # Only block images and fonts — keep CSS so layout renders properly
         def route_handler(route):
             if route.request.resource_type in ["image", "font", "media"]:
                 route.abort()
@@ -64,7 +130,6 @@ def scrape_prices(url):
         print("Loading page...", file=sys.stderr)
         page.goto(url, wait_until="domcontentloaded", timeout=60000)
 
-        # Wait for the ticket list to actually render
         print("Waiting for ticket list to load...", file=sys.stderr)
         try:
             page.wait_for_selector(
@@ -75,7 +140,10 @@ def scrape_prices(url):
         except Exception:
             print("Ticket list selector timed out — continuing anyway", file=sys.stderr)
 
-        # Scroll the page to trigger lazy-loaded content
+        # Apply the quantity filter BEFORE scraping prices
+        select_quantity(page, quantity)
+
+        # Scroll to trigger lazy loading
         page.evaluate("window.scrollTo(0, document.body.scrollHeight / 2)")
         time.sleep(2)
         page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
@@ -83,34 +151,28 @@ def scrape_prices(url):
         page.evaluate("window.scrollTo(0, 0)")
         time.sleep(2)
 
-        # Extract prices from the DOM
         dom_data = page.evaluate("""
             () => {
                 const result = { prices: [], ticketCards: [] };
-
-                // Grab all $XX.XX patterns from the full page text
                 const allText = document.body.innerText || "";
-                const dollarMatches = allText.match(/\\$[\\d,]+(?:\\.\\d{2})?/g) || [];
-                result.prices = [...new Set(dollarMatches)];
+                const matches = allText.match(/\\$[\\d,]+(?:\\.\\d{2})?/g) || [];
+                result.prices = [...new Set(matches)];
 
-                // Try to grab structured ticket card data
                 const cards = document.querySelectorAll('[data-testid*="quick-pick"], [data-testid*="ticket-card"], [class*="quick-pick"], [class*="QuickPick"], li[class*="ticket"]');
                 cards.forEach(card => {
                     const text = (card.innerText || "").trim();
                     if (text) result.ticketCards.push(text);
                 });
-
                 return result;
             }
         """)
 
-        # Save the full rendered HTML for debugging
         html = page.content()
-
         browser.close()
 
     return {
         "url": url,
+        "quantity": quantity,
         "dom_prices": dom_data["prices"],
         "ticket_cards": dom_data["ticketCards"],
         "api_responses_count": len(api_data),
@@ -121,15 +183,29 @@ def scrape_prices(url):
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
-        print("Usage: python scraper.py <url>")
+        print("Usage: python scraper.py <url> [quantity]")
+        print('Example: python scraper.py "https://..." 2')
         sys.exit(1)
 
     url = sys.argv[1]
-    result, html = scrape_prices(url)
+
+    # Quantity either from CLI arg or interactive prompt
+    if len(sys.argv) >= 3:
+        try:
+            quantity = int(sys.argv[2])
+            if not (1 <= quantity <= 8):
+                raise ValueError
+        except ValueError:
+            print("Quantity must be a number between 1 and 8")
+            sys.exit(1)
+    else:
+        quantity = prompt_for_quantity()
+
+    result, html = scrape_prices(url, quantity)
 
     ts = int(time.time())
-    json_file = f"prices_{ts}.json"
-    html_file = f"debug_{ts}.html"
+    json_file = f"prices_{quantity}tickets_{ts}.json"
+    html_file = f"debug_{quantity}tickets_{ts}.html"
 
     with open(json_file, "w", encoding="utf-8") as f:
         json.dump(result, f, indent=2)
@@ -138,7 +214,8 @@ if __name__ == "__main__":
 
     print(f"\nSaved price data to {json_file}", file=sys.stderr)
     print(f"Saved debug HTML to {html_file}", file=sys.stderr)
-    print(f"\nFound {len(result['dom_prices'])} prices, {len(result['ticket_cards'])} ticket cards, {result['api_responses_count']} API responses")
+    print(f"\nResults for {quantity} ticket(s):")
+    print(f"  {len(result['dom_prices'])} prices, {len(result['ticket_cards'])} ticket cards, {result['api_responses_count']} API responses")
     if result["dom_prices"]:
         print("\nPrices found:")
         for p in result["dom_prices"]:
