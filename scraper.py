@@ -1,12 +1,98 @@
 import sys
+import os
 import json
 import time
+import urllib.parse
+import urllib.request
 
 try:
     from playwright.sync_api import sync_playwright
 except ImportError:
     print("Playwright not installed. Run: pip install playwright && playwright install chromium")
     sys.exit(1)
+
+
+DISCOVERY_API = "https://app.ticketmaster.com/discovery/v2/events.json"
+
+
+def get_api_key():
+    """Read Ticketmaster API key from env var or .env file."""
+    key = os.environ.get("TICKETMASTER_API_KEY")
+    if key:
+        return key
+    # Fallback: look for a .env file next to this script
+    env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+    if os.path.exists(env_path):
+        with open(env_path) as f:
+            for line in f:
+                line = line.strip()
+                if line.startswith("TICKETMASTER_API_KEY="):
+                    return line.split("=", 1)[1].strip().strip('"').strip("'")
+    return None
+
+
+def search_events(keyword, size=5):
+    """Call Ticketmaster Discovery API and return top N events."""
+    api_key = get_api_key()
+    if not api_key:
+        print("ERROR: TICKETMASTER_API_KEY not set.", file=sys.stderr)
+        print("Get a free key at https://developer.ticketmaster.com/user/register", file=sys.stderr)
+        print("Then either:", file=sys.stderr)
+        print("  1. Set env var: export TICKETMASTER_API_KEY=your_key_here", file=sys.stderr)
+        print("  2. Or create a .env file with: TICKETMASTER_API_KEY=your_key_here", file=sys.stderr)
+        sys.exit(1)
+
+    params = {
+        "apikey": api_key,
+        "keyword": keyword,
+        "size": size,
+        "sort": "date,asc",
+    }
+    url = DISCOVERY_API + "?" + urllib.parse.urlencode(params)
+
+    print(f"Searching for: {keyword}...", file=sys.stderr)
+    try:
+        with urllib.request.urlopen(url, timeout=15) as resp:
+            data = json.loads(resp.read().decode())
+    except Exception as e:
+        print(f"Discovery API error: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    events = data.get("_embedded", {}).get("events", [])
+    if not events:
+        print(f"No events found for '{keyword}'.")
+        sys.exit(0)
+    return events
+
+
+def choose_event(events):
+    """Print top events and let the user pick one."""
+    print("\nTop results:\n")
+    for i, ev in enumerate(events, 1):
+        name = ev.get("name", "Unknown")
+        date_info = ev.get("dates", {}).get("start", {})
+        date = date_info.get("localDate", "TBD")
+        tm = date_info.get("localTime", "")
+        venue = ""
+        venues = ev.get("_embedded", {}).get("venues", [])
+        if venues:
+            v = venues[0]
+            city = v.get("city", {}).get("name", "")
+            state = v.get("state", {}).get("stateCode", "")
+            venue = f"{v.get('name', '')} — {city}, {state}".strip(" —,")
+        print(f"  {i}. {name}")
+        print(f"     {date} {tm}  |  {venue}")
+    print()
+
+    while True:
+        try:
+            choice = input(f"Pick an event (1-{len(events)}): ").strip()
+            idx = int(choice)
+            if 1 <= idx <= len(events):
+                return events[idx - 1]
+            print(f"Please enter a number between 1 and {len(events)}.")
+        except ValueError:
+            print("Please enter a valid number.")
 
 
 def prompt_for_quantity():
@@ -182,26 +268,50 @@ def scrape_prices(url, quantity):
 
 
 if __name__ == "__main__":
-    if len(sys.argv) < 2:
-        print("Usage: python scraper.py <url> [quantity]")
-        print('Example: python scraper.py "https://..." 2')
-        sys.exit(1)
-
-    url = sys.argv[1]
-
-    # Quantity either from CLI arg or interactive prompt
-    if len(sys.argv) >= 3:
-        try:
-            quantity = int(sys.argv[2])
-            if not (1 <= quantity <= 8):
-                raise ValueError
-        except ValueError:
-            print("Quantity must be a number between 1 and 8")
+    # Usage:
+    #   python scraper.py <url> [quantity]           -> scrape a specific event URL
+    #   python scraper.py --search <keyword>         -> search via Discovery API, pick event, scrape
+    #   python scraper.py                            -> interactive: prompt for search keyword
+    event_name = None
+    if len(sys.argv) >= 2 and sys.argv[1] == "--search":
+        if len(sys.argv) < 3:
+            print("Usage: python scraper.py --search <keyword>")
             sys.exit(1)
+        keyword = " ".join(sys.argv[2:])
+        events = search_events(keyword, size=5)
+        chosen = choose_event(events)
+        url = chosen.get("url")
+        event_name = chosen.get("name")
+        print(f"\nSelected: {event_name}\n{url}\n", file=sys.stderr)
+        quantity = prompt_for_quantity()
+    elif len(sys.argv) >= 2 and sys.argv[1].startswith("http"):
+        url = sys.argv[1]
+        if len(sys.argv) >= 3:
+            try:
+                quantity = int(sys.argv[2])
+                if not (1 <= quantity <= 8):
+                    raise ValueError
+            except ValueError:
+                print("Quantity must be a number between 1 and 8")
+                sys.exit(1)
+        else:
+            quantity = prompt_for_quantity()
     else:
+        # No args: interactive search mode
+        keyword = input("Search for an event: ").strip()
+        if not keyword:
+            print("No keyword entered. Exiting.")
+            sys.exit(0)
+        events = search_events(keyword, size=5)
+        chosen = choose_event(events)
+        url = chosen.get("url")
+        event_name = chosen.get("name")
+        print(f"\nSelected: {event_name}\n{url}\n", file=sys.stderr)
         quantity = prompt_for_quantity()
 
     result, html = scrape_prices(url, quantity)
+    if event_name:
+        result["event_name"] = event_name
 
     ts = int(time.time())
     json_file = f"prices_{quantity}tickets_{ts}.json"
