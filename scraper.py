@@ -1,4 +1,5 @@
 import sys
+import json
 import time
 
 try:
@@ -8,7 +9,23 @@ except ImportError:
     sys.exit(1)
 
 
-def scrape(url, output_mode="html"):
+def scrape_prices(url):
+    prices = []
+    api_data = []
+
+    def capture_response(response):
+        """Intercept API responses that contain ticket/price data."""
+        resp_url = response.url
+        if any(keyword in resp_url for keyword in [
+            "offers", "inventory", "price", "ticket", "availability",
+            "resale", "api/event", "shape", "quickpicks"
+        ]):
+            try:
+                body = response.json()
+                api_data.append({"url": resp_url, "data": body})
+            except Exception:
+                pass
+
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
         context = browser.new_context(
@@ -18,31 +35,75 @@ def scrape(url, output_mode="html"):
         )
         page = context.new_page()
 
-        print(f"Navigating to: {url}", file=sys.stderr)
-        page.goto(url, wait_until="networkidle", timeout=60000)
+        # Block heavy resources - images, stylesheets, fonts, media
+        page.route("**/*.{png,jpg,jpeg,gif,svg,webp,woff,woff2,ttf,eot,mp4,mp3}", lambda route: route.abort())
+        page.route("**/*", lambda route: route.abort() if route.request.resource_type in ["image", "stylesheet", "font", "media"] else route.continue_())
 
-        # Wait for dynamic content
+        # Listen for API responses with price data
+        page.on("response", capture_response)
+
+        print("Loading page...", file=sys.stderr)
+        page.goto(url, wait_until="domcontentloaded", timeout=60000)
+
+        # Shorter wait — we're listening for API calls, not rendering
         time.sleep(5)
 
-        html = page.content()
-
-        if output_mode == "file":
-            filename = f"scraped_{int(time.time())}.html"
-            with open(filename, "w", encoding="utf-8") as f:
-                f.write(html)
-            print(f"Saved to {filename} ({len(html)} bytes)", file=sys.stderr)
-        else:
-            print(html)
+        # Also scrape any visible prices from the DOM as fallback
+        price_elements = page.evaluate("""
+            () => {
+                const results = [];
+                // Common Ticketmaster price selectors
+                const selectors = [
+                    '[data-testid*="price"]',
+                    '[class*="price"]',
+                    '[class*="Price"]',
+                    '[class*="cost"]',
+                    '[class*="ticket"]',
+                    '[aria-label*="price"]',
+                    '[aria-label*="Price"]',
+                ];
+                for (const sel of selectors) {
+                    document.querySelectorAll(sel).forEach(el => {
+                        const text = el.innerText.trim();
+                        if (text && text.match(/\\$[\\d,.]+/)) {
+                            results.push(text);
+                        }
+                    });
+                }
+                // Also grab anything that looks like a dollar amount
+                const allText = document.body.innerText;
+                const dollarMatches = allText.match(/\\$[\\d,]+\\.?\\d{0,2}/g);
+                if (dollarMatches) {
+                    results.push(...dollarMatches);
+                }
+                return [...new Set(results)];
+            }
+        """)
 
         browser.close()
+
+    output = {
+        "url": url,
+        "dom_prices": price_elements,
+        "api_responses": api_data,
+    }
+
+    return output
 
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
-        print("Usage: python scraper.py <url> [html|file]")
-        print('Example: python scraper.py "https://www.ticketmaster.com/event/..." file')
+        print("Usage: python scraper.py <url>")
         sys.exit(1)
 
     url = sys.argv[1]
-    mode = sys.argv[2] if len(sys.argv) > 2 else "html"
-    scrape(url, mode)
+    result = scrape_prices(url)
+
+    # Save raw JSON
+    filename = f"prices_{int(time.time())}.json"
+    with open(filename, "w", encoding="utf-8") as f:
+        json.dump(result, f, indent=2)
+
+    # Print summary
+    print(f"\nSaved full data to {filename}", file=sys.stderr)
+    print(json.dumps(result, indent=2))
