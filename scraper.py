@@ -16,18 +16,41 @@ DISCOVERY_API = "https://app.ticketmaster.com/discovery/v2/events.json"
 
 
 def get_api_key():
-    """Read Ticketmaster API key from env var or .env file."""
+    """Read Ticketmaster API key from env var or .env file.
+
+    Handles UTF-8 BOM and UTF-16 (PowerShell default) encodings.
+    Also checks current working directory and script directory.
+    """
     key = os.environ.get("TICKETMASTER_API_KEY")
     if key:
-        return key
-    # Fallback: look for a .env file next to this script
-    env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
-    if os.path.exists(env_path):
-        with open(env_path) as f:
-            for line in f:
-                line = line.strip()
-                if line.startswith("TICKETMASTER_API_KEY="):
-                    return line.split("=", 1)[1].strip().strip('"').strip("'")
+        return key.strip()
+
+    # Check both the current working directory and the script directory
+    candidates = [
+        os.path.join(os.getcwd(), ".env"),
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"),
+    ]
+
+    for env_path in candidates:
+        if not os.path.exists(env_path):
+            continue
+        # Try multiple encodings to handle PowerShell quirks
+        for enc in ("utf-8-sig", "utf-8", "utf-16", "utf-16-le", "latin-1"):
+            try:
+                with open(env_path, encoding=enc) as f:
+                    content = f.read()
+                # Strip any leftover BOM / null bytes
+                content = content.replace("\x00", "").lstrip("\ufeff")
+                for line in content.splitlines():
+                    line = line.strip().lstrip("\ufeff")
+                    if line.startswith("TICKETMASTER_API_KEY"):
+                        _, _, val = line.partition("=")
+                        val = val.strip().strip('"').strip("'")
+                        if val:
+                            return val
+                break  # file read fine, key just not in it
+            except (UnicodeDecodeError, UnicodeError):
+                continue
     return None
 
 
@@ -36,10 +59,11 @@ def search_events(keyword, size=5):
     api_key = get_api_key()
     if not api_key:
         print("ERROR: TICKETMASTER_API_KEY not set.", file=sys.stderr)
+        print(f"  Checked env var TICKETMASTER_API_KEY", file=sys.stderr)
+        print(f"  Checked .env in: {os.getcwd()}", file=sys.stderr)
+        print(f"  Checked .env in: {os.path.dirname(os.path.abspath(__file__))}", file=sys.stderr)
         print("Get a free key at https://developer.ticketmaster.com/user/register", file=sys.stderr)
-        print("Then either:", file=sys.stderr)
-        print("  1. Set env var: export TICKETMASTER_API_KEY=your_key_here", file=sys.stderr)
-        print("  2. Or create a .env file with: TICKETMASTER_API_KEY=your_key_here", file=sys.stderr)
+        print("Then create a .env file with: TICKETMASTER_API_KEY=your_key_here", file=sys.stderr)
         sys.exit(1)
 
     params = {
